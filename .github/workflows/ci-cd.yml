@@ -1,0 +1,78 @@
+name: CI/CD - TramaSul One-Page
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/eliasalmeidaa/tramasul-onepage
+
+jobs:
+  ci:
+    name: CI - Build e Teste
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Validar arquivos
+        run: |
+          test -f index.html
+          test -f Dockerfile
+          grep -q "INSTANCE_LABEL" index.html
+          echo "Arquivos OK"
+
+      - name: Build da imagem Docker
+        run: docker build --build-arg VERSION=${{ github.sha }} -t tramasul:teste .
+
+      - name: Teste do container (smoke test)
+        run: |
+          docker run -d --name teste -p 8080:80 tramasul:teste
+          sleep 3
+          curl -sf http://localhost:8080 | grep -q "TramaSul"
+          curl -sf http://localhost:8080/version.txt
+          echo "Container respondendo OK"
+          docker rm -f teste
+
+  cd:
+    name: CD - Publicar imagem e implantar na EC2
+    needs: ci
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Login no GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push da imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: VERSION=${{ github.sha }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Aguardar implantação na EC2 (Watchtower)
+        run: |
+          echo "Aguardando a EC2 (${{ vars.EC2_HOST }}) atualizar para ${{ github.sha }}"
+          for i in $(seq 1 30); do
+            V=$(curl -s --max-time 5 http://${{ vars.EC2_HOST }}/version.txt || true)
+            echo "Tentativa $i: versão no ar = $V"
+            if [ "$V" = "${{ github.sha }}" ]; then echo "Deploy concluído na EC2"; exit 0; fi
+            sleep 10
+          done
+          echo "A EC2 não atualizou a tempo"; exit 1
